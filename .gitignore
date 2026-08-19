@@ -1,0 +1,14 @@
+venvPS/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# Experiment output (keep committed samples under data/experiments/ if desired)
+# data/experiments/
+
+# Broadcom SDK DLLs (install locally via WAVES; not redistributable)
+hardware/spectrometer/broadcom_sdk/*.dll

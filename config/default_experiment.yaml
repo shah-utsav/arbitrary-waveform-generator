@@ -1,0 +1,82 @@
+# =============================================================================
+# Default experiment configuration for optical pulse shaping
+# =============================================================================
+# Run (from repo root, 64-bit Python recommended):
+#   python run_experiment.py --dry-run
+#   python run_experiment.py --awg dummy --spec nio_qmini
+#   python run_experiment.py --awg spectrum --spec nio_qmini
+#
+# AWG timing (Ext0-locked bursts, not free-run RF):
+#   segment_duration_us  ↔  main.py T        (one library segment length in µs)
+#   schedule.repeats     →  tiles that segment into MEMSIZE (longer RF per Trg0)
+#   SPC_LOOPS            =  0 by default (one MEMSIZE per Ext0, forever)
+#   acquire_loops > 0    →  explicit SPC_LOOPS override (stops after N total plays)
+# Do NOT map schedule.repeats → SPC_LOOPS (that was the old wrong mapping).
+# =============================================================================
+
+experiment:
+  name: "double_pulse_demo"
+  output_dir: "data/experiments"
+
+awg:
+  sampling_rate_MSa_s: 1250
+  segment_duration_us: 10      # main.py T — one MEMSIZE segment length
+  voltage_max_mV: 2000
+  backend: dummy
+  device: /dev/spcm0
+  trigger_mode: external       # DG645 TTL → Trg0; prompt can choose software/internal
+  # Interactive runs also ask for trigger / voltage (mV) / sampling rate (MSa/s).
+  # Use --no-prompt to skip questions and use these YAML values.
+  inter_segment_gap_us: 0
+  playback_mode: per_block     # one library segment per block (main.py-like)
+  concatenated_loops: 1
+  # SPC_LOOPS: 0 = one MEMSIZE per Ext0 forever (recommended). >0 = stop after N plays.
+  # Longer RF per trigger = schedule.repeats tiles the segment into MEMSIZE.
+  acquire_loops: 0
+
+calibration:
+  coefficients: [0, 1, 0]
+
+waveforms:
+  - id: wf1
+    carrier_freq_MHz: 100
+    amp_control: 1.0
+    randomize_carrier_phase: false
+    phase_mask:
+      type: constant
+    amplitude_mask:
+      type: double_pulse
+      R: 1.0
+      w0: 0.0
+      tau: 1.0
+      phi: 0.0
+
+  - id: wf2
+    carrier_freq_MHz: 100
+    amp_control: 1.0
+    randomize_carrier_phase: false
+    phase_mask:
+      type: constant
+    amplitude_mask:
+      type: double_pulse
+      R: 1.0
+      w0: 0.0
+      tau: 2.0
+      phi: 0.0
+
+schedule:
+  # repeats = how many times to tile the library segment into MEMSIZE per Trg0
+  - waveform_id: wf1
+    repeats: 5
+  - waveform_id: wf2
+    repeats: 5
+
+spectrometer:
+  # dummy = simulated; nio_qmini = PyUSB / pyrgbdriverkit (64-bit, no pythonnet)
+  backend: nio_qmini
+  frames_to_average: 50
+  integration_time_ms: 10
+  # Delay after AWG arm before first spectrum frame (ms). Tune later.
+  settle_delay_ms: 10
+  device_index: 0
+  # serial_number: "YOUR_SERIAL"   # optional: lock to one device

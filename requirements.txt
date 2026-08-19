@@ -1,0 +1,35 @@
+# =============================================================================
+# Optical Pulse Shaping — Python dependencies
+# =============================================================================
+# Install (64-bit Python 3.11+ recommended):
+#   python -m venv .venv64
+#   .venv64\Scripts\activate.bat
+#   python -m pip install -r requirements.txt
+# =============================================================================
+
+# ---- Core runtime (required) ------------------------------------------------
+numpy>=1.24
+PyYAML>=6.0
+
+# ---- Spectrometer (NioLink / PyUSB, 64-bit) ---------------------------------
+pyusb>=1.2
+libusb-package>=1.0.26
+
+# ---- Plotting (optional but works on 64-bit Python) -------------------------
+matplotlib>=3.8
+
+# =============================================================================
+# NON-PIP DRIVERS
+# =============================================================================
+# Spectrum AWG (M4i.66xx):
+#   https://spectrum-instrumentation.com/products/drivers_examples/win_driver.php
+#   pyspcm auto-loads spcm_win64.dll on 64-bit Python.
+#   Verify: python run_experiment.py --check-awg
+#
+# Broadcom Qmini spectrometer:
+#   Vendored pyrgbdriverkit in hardware/spectrometer/vendor/pyrgbdriverkit-0.3.7/
+#   Close WAVES before Python (exclusive USB access).
+#   Verify: python run_experiment.py --check-spec
+#
+# Legacy WAVES / pythonnet backend (archived Jul 2026):
+#   See hardware/spectrometer/_broadcom_*.py and README "Architecture history".

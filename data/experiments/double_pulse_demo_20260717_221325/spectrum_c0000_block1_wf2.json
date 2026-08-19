@@ -1,0 +1,13 @@
+{
+  "waveform_id": "wf2",
+  "schedule_index": 1,
+  "repeats": 10,
+  "frames_averaged": 50,
+  "total_samples": 125120,
+  "total_shots": 10,
+  "segment_length": 12512,
+  "cycle": 0,
+  "spectrum_file": "spectrum_c0000_block1_wf2.npy",
+  "waveform_file": "waveform_wf2.npy",
+  "played_buffer_file": "played_c0000_block1_wf2.npy"
+}

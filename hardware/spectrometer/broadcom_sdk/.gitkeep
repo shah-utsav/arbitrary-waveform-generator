@@ -1,0 +1,4 @@
+# Copy locally (not in git):
+#   RgbDriverKit.dll  — from Broadcom spectrometer SDK or WAVES install
+#   FTD2XX_NET.dll    — from FTDI (NOT in newer Broadcom SDK zips):
+#     https://ftdichip.com/software-examples/code-examples/csharp-examples/

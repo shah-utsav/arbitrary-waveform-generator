@@ -24,3 +24,4 @@ def pvAllocMemPageAligned (qwBytes):
     else:
         dwOffset = 0
     return(c_char * qwBytes).from_buffer(pvNonAlignedBuf, dwOffset)
+

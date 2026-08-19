@@ -1,0 +1,92 @@
+{
+  "experiment_name": "double_pulse_demo",
+  "awg": {
+    "sampling_rate_MSa_s": 1250.0,
+    "segment_duration_us": 10.0,
+    "voltage_max_mV": 2000,
+    "backend": "dummy",
+    "trigger_mode": "software",
+    "inter_segment_gap_us": 0.0,
+    "playback_mode": "per_block",
+    "concatenated_loops": 1,
+    "device": "/dev/spcm0"
+  },
+  "calibration": {
+    "coefficients": [
+      0,
+      1,
+      0
+    ]
+  },
+  "waveforms": [
+    {
+      "id": "wf1",
+      "carrier_freq_MHz": 100.0,
+      "amp_control": 1.0,
+      "randomize_carrier_phase": false,
+      "phase_mask": {
+        "type": "constant",
+        "w0": 0.0,
+        "phi_n": []
+      },
+      "amplitude_mask": {
+        "type": "double_pulse",
+        "R": 1.0,
+        "w0": 0.0,
+        "w0_list": [],
+        "tau": 1.0,
+        "phi": 0.0,
+        "FWHM_w": 1.0
+      }
+    },
+    {
+      "id": "wf2",
+      "carrier_freq_MHz": 100.0,
+      "amp_control": 1.0,
+      "randomize_carrier_phase": false,
+      "phase_mask": {
+        "type": "constant",
+        "w0": 0.0,
+        "phi_n": []
+      },
+      "amplitude_mask": {
+        "type": "double_pulse",
+        "R": 1.0,
+        "w0": 0.0,
+        "w0_list": [],
+        "tau": 2.0,
+        "phi": 0.0,
+        "FWHM_w": 1.0
+      }
+    }
+  ],
+  "schedule": [
+    {
+      "waveform_id": "wf1",
+      "repeats": 10
+    },
+    {
+      "waveform_id": "wf2",
+      "repeats": 10
+    }
+  ],
+  "spectrometer": {
+    "backend": "broadcom_qmini",
+    "frames_to_average": 50,
+    "integration_time_ms": 10.0,
+    "dll_dir": null,
+    "device_index": 0
+  },
+  "results_summary": [
+    {
+      "waveform_id": "wf1",
+      "schedule_index": 0,
+      "frames_averaged": 50
+    },
+    {
+      "waveform_id": "wf2",
+      "schedule_index": 1,
+      "frames_averaged": 50
+    }
+  ]
+}
