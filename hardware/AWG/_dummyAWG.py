@@ -61,6 +61,11 @@ class Dummy_AWG:
         self.num_segments = 1
         self.segment_length = int(record_length)
         self._card_is_running = False
+        # Same flag as Spectrum_AWG — soft on/off of RF burst edges.
+        self.envelope_burst = False
+        self.scope_lock_pulse = False
+        self._scope_lock_samples = 0
+        self.enable_x0_sync = False
 
     def open_card(self, device_path="/dev/spcm0"):
         """Always succeeds — there is no hardware to miss."""
@@ -143,6 +148,16 @@ class Dummy_AWG:
                     f"[Dummy_AWG]   segments={self.num_segments} × "
                     f"{self.segment_length} samples"
                 )
+            if trigger_mode == "internal":
+                print(
+                    "[Dummy_AWG] (On a real card X0 would be CONTOUTMARK — "
+                    "trigger the scope on X0, not Ch0 RF.)"
+                )
+            else:
+                print(
+                    "[Dummy_AWG] (On a real card X0 would be TRIGOUT — "
+                    "or trigger the scope from the DG645.)"
+                )
 
     def allocate_buffer(self):
         self.buffer = np.zeros(self.RECORD_LENGTH, dtype=np.int16)
@@ -150,22 +165,60 @@ class Dummy_AWG:
             print(f"[Dummy_AWG] Allocated dummy buffer of {self.RECORD_LENGTH} int16 samples.")
 
     def build_internal_period(self, burst, period_s):
-        """Same RF + zeros padding as Spectrum_AWG.build_internal_period."""
+        """Same RF + zeros (+ optional Ch0 lock tip) as Spectrum_AWG."""
         burst = np.asarray(burst, dtype=np.float64).ravel()
+        if self.envelope_burst:
+            burst = self._apply_burst_envelope(burst, float(self.SR))
+
+        tip_n = 0
+        gap_n = 0
+        if self.scope_lock_pulse:
+            tip_n = _align32(max(32, int(round(100e-9 * float(self.SR)))))
+            gap_n = tip_n
+
         burst_n = _align32(max(burst.size, 32))
-        total = _align32(max(burst_n + 32, int(round(float(period_s) * self.SR))))
+        head = tip_n + gap_n
+        target = int(round(float(period_s) * float(self.SR)))
+        # Nearest multiple of 32 (same as Spectrum_AWG._nearest_align32).
+        lo = (max(target, head + burst_n + 32) // 32) * 32
+        hi = lo + 32
+        n0 = max(target, head + burst_n + 32)
+        total = lo if (lo >= 32 and n0 - lo <= hi - n0) else hi
+        if total < head + burst_n + 32:
+            total = _align32(head + burst_n + 32)
+
         period = np.zeros(total, dtype=np.float64)
+        if tip_n:
+            period[:tip_n] = 0.95
+            self._scope_lock_samples = tip_n
         n = min(burst.size, burst_n)
-        period[:n] = np.clip(burst[:n], -1.0, 1.0)
+        period[head : head + n] = np.clip(burst[:n], -1.0, 1.0)
+
         if self.verbose:
+            hz = float(self.SR) / float(total)
             print(
-                f"[Dummy_AWG] Internal period: {n} RF samples + {total - n} zeros "
-                f"= {total} samples ({1e6 * total / self.SR:.6f} us)"
+                f"[Dummy_AWG] Internal period: tip={tip_n} + gap={gap_n} + "
+                f"RF={n} + idle={total - head - n} = {total} samples "
+                f"({1e6 * total / self.SR:.6f} us, {hz:.9f} Hz)"
             )
         return period
 
+    @staticmethod
+    def _apply_burst_envelope(burst, sr_hz):
+        """Same raised-cosine on/off as Spectrum_AWG (for identical math dry-runs)."""
+        x = np.asarray(burst, dtype=np.float64).copy()
+        n = x.size
+        if n < 64:
+            return x
+        edge = int(round(200e-9 * float(sr_hz)))
+        edge = max(32, min(edge, n // 10))
+        ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(edge) / float(edge)))
+        x[:edge] *= ramp
+        x[-edge:] *= ramp[::-1]
+        return x
+
     def load_waveform_in_buffer(self, voltage_array):
-        voltage_array = np.asarray(voltage_array)
+        voltage_array = np.asarray(voltage_array, dtype=np.float64).ravel()
         if voltage_array.size != self.RECORD_LENGTH:
             print(
                 f"[Dummy_AWG] Waveform length {voltage_array.size} does not match "
@@ -173,14 +226,14 @@ class Dummy_AWG:
             )
             raise SystemExit(1)
 
+        if self.envelope_burst and self.trigger_mode == "external":
+            voltage_array = self._apply_burst_envelope(voltage_array, float(self.SR))
+
         max_dac = self.lMaxADC
-        if not np.issubdtype(voltage_array.dtype, np.integer):
-            if np.any(voltage_array < -1) or np.any(voltage_array > 1):
-                print("[Dummy_AWG] Warning: waveform clipped to [-1, 1] before scaling.")
-            clipped = np.clip(voltage_array, -1, 1)
-            self.buffer = (max_dac * clipped).astype(np.int16)
-        else:
-            self.buffer = np.clip(voltage_array, -max_dac, max_dac).astype(np.int16)
+        if np.any(voltage_array < -1) or np.any(voltage_array > 1):
+            print("[Dummy_AWG] Warning: waveform clipped to [-1, 1] before scaling.")
+        clipped = np.clip(voltage_array, -1, 1)
+        self.buffer = (max_dac * clipped).astype(np.int16)
         if self.verbose:
             print("[Dummy_AWG] Loaded waveform into dummy buffer.")
 
@@ -208,6 +261,8 @@ class Dummy_AWG:
         max_dac = self.lMaxADC
         self.buffer = np.zeros(self.RECORD_LENGTH, dtype=np.int16)
         for i, a in enumerate(arrays):
+            if self.envelope_burst:
+                a = self._apply_burst_envelope(a, float(self.SR))
             padded = np.zeros(seg_len, dtype=np.float64)
             padded[: a.size] = np.clip(a, -1.0, 1.0)
             self.buffer[i * seg_len : (i + 1) * seg_len] = (max_dac * padded).astype(np.int16)

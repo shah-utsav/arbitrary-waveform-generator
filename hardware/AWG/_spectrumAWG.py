@@ -105,6 +105,13 @@ class Spectrum_AWG:
         self.num_segments = 1
         self.segment_length = int(record_length)
         self._card_is_running = False
+        # Optional soft on/off of RF edges (off by default — keep RF as the PI built it).
+        self.envelope_burst = False
+        # Optional short DC tip for Ch0 scope-lock (off by default).
+        self.scope_lock_pulse = False
+        self._scope_lock_samples = 0
+        # Optional X0 period marker (off by default until internal RF is confirmed).
+        self.enable_x0_sync = False
 
     # ------------------------------------------------------------------
     # Open / close
@@ -276,20 +283,24 @@ class Spectrum_AWG:
             self.RECORD_LENGTH = self.segment_length * self.num_segments
         elif playback == "multi" and trigger_mode == "internal":
             # No Ext0: play every segment back-to-back on the sample clock.
+            # SINGLE + LOOPS=0 free-runs MEMSIZE after one software trigger
+            # (this is the path that produced visible pulses on the bench).
             card_mode = SPC_REP_STD_SINGLE
             if segment_samples is None:
                 segment_samples = self.RECORD_LENGTH // max(int(num_segments), 1)
             self.segment_length = _align32(segment_samples)
             self.num_segments = int(num_segments)
             self.RECORD_LENGTH = _align32(self.segment_length * self.num_segments)
-            self.loops = 0  # free-run the concatenated period
+            self.loops = 0
         elif trigger_mode == "external":
             # Same MEMSIZE on every Ext0.
             card_mode = SPC_REP_STD_SINGLERESTART
             self.num_segments = 1
             self.segment_length = int(self.RECORD_LENGTH)
         else:
-            # Internal single: free-run MEMSIZE after one software start.
+            # Internal single: SINGLE + LOOPS=0 → one software start, then
+            # free-run MEMSIZE forever (M4i manual Table 52). Do NOT use
+            # SPC_REP_STD_CONTINUOUS here — on this card it can leave Ch0 quiet.
             card_mode = SPC_REP_STD_SINGLE
             self.num_segments = 1
             self.segment_length = int(self.RECORD_LENGTH)
@@ -325,8 +336,20 @@ class Spectrum_AWG:
         spcm_dwSetParam_i32(self.hCard, SPC_AMP0, int32(self.OUTPUT_RANGE_MV))
         spcm_dwSetParam_i64(self.hCard, SPC_ENABLEOUT0, int32(1))
 
+        # Use the rate the card actually programmed (may differ slightly from
+        # the requested SR). Period timing follows this value.
+        actual_sr = int64(0)
+        spcm_dwGetParam_i64(self.hCard, SPC_SAMPLERATE, byref(actual_sr))
+        if actual_sr.value > 0:
+            self.SR = int(actual_sr.value)
+
+        # Optional once-per-period TTL on X0 (disabled by default).
+        if self.enable_x0_sync:
+            self._enable_scope_sync_marker()
+
         if self.verbose:
             mem_us = 1e6 * float(self.RECORD_LENGTH) / float(self.SR)
+            mem_hz = float(self.SR) / float(self.RECORD_LENGTH)
             names = {
                 SPC_REP_STD_SINGLE: "SINGLE",
                 SPC_REP_STD_SINGLERESTART: "SINGLERESTART",
@@ -335,7 +358,7 @@ class Spectrum_AWG:
             print(
                 f"[Spectrum_AWG] {names.get(card_mode, card_mode)}  "
                 f"clock=INTPLL  SR={self.SR * 1e-6} MSa/s  "
-                f"MEMSIZE={self.RECORD_LENGTH} (~{mem_us:.3f} us)  "
+                f"MEMSIZE={self.RECORD_LENGTH} (~{mem_us:.6f} us, {mem_hz:.9f} Hz)  "
                 f"trigger={trigger_mode}  playback={playback}  "
                 f"SPC_LOOPS={self.loops}"
             )
@@ -359,27 +382,115 @@ class Spectrum_AWG:
                 f"[Spectrum_AWG] Allocated buffer of {self.RECORD_LENGTH} int16 samples."
             )
 
+    def _enable_scope_sync_marker(self):
+        """
+        Drive multi-purpose connector X0 as a once-per-period TTL for the scope.
+
+        Manual note: CONTOUTMARK marks the beginning of each continuous-replay
+        loop; the pulse is ~½ MEMSIZE long. Use the *legacy* X0 register first
+        (47200) — that is what the M4i.66xx manual documents.
+        """
+        try:
+            if self.trigger_mode == "internal":
+                mode = SPCM_XMODE_CONTOUTMARK
+                label = "CONTOUTMARK (once per MEMSIZE period)"
+                # Some firmware builds also want this enable bit.
+                try:
+                    spcm_dwSetParam_i32(self.hCard, SPC_CONTOUTMARK, int32(1))
+                except Exception:
+                    pass
+            else:
+                mode = SPCM_XMODE_TRIGOUT
+                label = "TRIGOUT (once per accepted Ext0)"
+
+            # Manual lists SPCM_X0_MODE = 47200 (legacy). Try that first.
+            err = spcm_dwSetParam_i32(self.hCard, SPCM_LEGACY_X0_MODE, mode)
+            if err != 0:
+                err = spcm_dwSetParam_i32(self.hCard, SPCM_X0_MODE, mode)
+
+            if self.verbose:
+                if err == 0:
+                    print(
+                        f"[Spectrum_AWG] X0 sync enabled: {label}."
+                    )
+                else:
+                    print(
+                        f"[Spectrum_AWG] X0 sync setup returned err={err} — "
+                        "use the Ch0 lock tip or match the DG645 rate printed above."
+                    )
+        except Exception as exc:
+            if self.verbose:
+                print(f"[Spectrum_AWG] X0 sync not available: {exc}")
+
+    @staticmethod
+    def _apply_burst_envelope(burst, sr_hz):
+        """
+        Raised-cosine on/off (~200 ns) so Ch0 has one clear amplitude edge
+        per burst. Helps if the scope is still accidentally triggering on Ch0
+        RF cycles instead of on the lock tip / X0.
+        """
+        x = np.asarray(burst, dtype=np.float64).copy()
+        n = x.size
+        if n < 64:
+            return x
+        edge = int(round(200e-9 * float(sr_hz)))
+        edge = max(32, min(edge, n // 10))
+        ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(edge) / float(edge)))
+        x[:edge] *= ramp
+        x[-edge:] *= ramp[::-1]
+        return x
+
+    @staticmethod
+    def _nearest_align32(n):
+        """Nearest multiple of 32 (ties round up). M4i DMA / MEMSIZE rule."""
+        n = int(max(n, 32))
+        lo = (n // 32) * 32
+        hi = lo + 32
+        if lo < 32:
+            return hi
+        if n - lo <= hi - n:
+            return lo
+        return hi
+
     def build_internal_period(self, burst, period_s):
         """
-        Build one sample-clock period: RF samples + trailing zeros.
+        Build one sample-clock period: [RF burst | idle zeros].
 
-        Why zeros? If you free-run *only* the RF burst, the card plays it
-        back-to-back and you see a continuous wave, not pulses. Padding idle
-        to period_s makes the built-in clock the pulse repetition clock.
+        Free-running only the RF burst back-to-back looks like CW. Padding
+        idle to period_s makes the built-in clock the pulse repetition clock.
 
-        burst     : float array in [-1, 1], length ≈ SR * T
-        period_s  : desired period in seconds (e.g. 0.001 for 1 kHz)
+        MEMSIZE is rounded *up* to a multiple of 32 (M4i rule), same as the
+        first working internal path in this project.
         """
         burst = np.asarray(burst, dtype=np.float64).ravel()
+        if self.envelope_burst:
+            burst = self._apply_burst_envelope(burst, float(self.SR))
+
+        tip_n = 0
+        gap_n = 0
+        if self.scope_lock_pulse:
+            tip_n = _align32(max(32, int(round(100e-9 * float(self.SR)))))
+            gap_n = tip_n
+
         burst_n = _align32(max(burst.size, 32))
-        total = _align32(max(burst_n + 32, int(round(float(period_s) * self.SR))))
+        head = tip_n + gap_n
+        # Round UP (not nearest) — matches the path that showed pulses on the bench.
+        total = _align32(max(head + burst_n + 32, int(round(float(period_s) * float(self.SR)))))
+
         period = np.zeros(total, dtype=np.float64)
+        if tip_n:
+            period[:tip_n] = 0.95
+            self._scope_lock_samples = tip_n
         n = min(burst.size, burst_n)
-        period[:n] = np.clip(burst[:n], -1.0, 1.0)
+        period[head : head + n] = np.clip(burst[:n], -1.0, 1.0)
+
         if self.verbose:
+            actual_hz = float(self.SR) / float(total)
             print(
-                f"[Spectrum_AWG] Internal period: {n} RF samples + {total - n} zeros "
-                f"= {total} samples ({1e6 * total / self.SR:.6f} us at {self.SR * 1e-6} MSa/s)"
+                f"[Spectrum_AWG] Internal period: RF={n} samples, "
+                f"idle={total - head - n}, tip={tip_n}, total={total} "
+                f"({1e6 * total / self.SR:.6f} us, {actual_hz:.9f} Hz). "
+                f"peak|V|={np.max(np.abs(period)):.4f}"
             )
         return period
 
@@ -390,7 +501,7 @@ class Spectrum_AWG:
         Length must equal RECORD_LENGTH. For internal single mode, pass the
         output of build_internal_period(), not the bare RF burst.
         """
-        voltage_array = np.asarray(voltage_array)
+        voltage_array = np.asarray(voltage_array, dtype=np.float64).ravel()
         if voltage_array.size != self.RECORD_LENGTH:
             print(
                 f"[Spectrum_AWG] Waveform length {voltage_array.size} does not match "
@@ -399,22 +510,19 @@ class Spectrum_AWG:
             )
             raise SystemExit(1)
 
+        # External single: envelope here (internal already applied in build_internal_period).
+        if self.envelope_burst and self.trigger_mode == "external":
+            voltage_array = self._apply_burst_envelope(voltage_array, float(self.SR))
+
         max_dac = self.lMaxADC.value - 1  # 32767; avoids wrapping at +32768
-        if not np.issubdtype(voltage_array.dtype, np.integer):
-            below = np.any(voltage_array < -1)
-            above = np.any(voltage_array > 1)
-            if below or above:
-                print(
-                    "[Spectrum_AWG] Warning: waveform clipped to [-1, 1] before DAC scaling."
-                )
-            clipped = np.clip(voltage_array, -1, 1)
-            codes = (max_dac * clipped).astype(np.int16)
-        else:
-            below = np.any(voltage_array < -max_dac)
-            above = np.any(voltage_array > max_dac)
-            if below or above:
-                print("[Spectrum_AWG] Warning: integer waveform clipped to DAC range.")
-            codes = np.clip(voltage_array, -max_dac, max_dac).astype(np.int16)
+        below = np.any(voltage_array < -1)
+        above = np.any(voltage_array > 1)
+        if below or above:
+            print(
+                "[Spectrum_AWG] Warning: waveform clipped to [-1, 1] before DAC scaling."
+            )
+        clipped = np.clip(voltage_array, -1, 1)
+        codes = (max_dac * clipped).astype(np.int16)
 
         ctypes.memmove(self.pnBuffer, codes.ctypes.data, codes.nbytes)
         if self.verbose:
@@ -453,6 +561,8 @@ class Spectrum_AWG:
         max_dac = self.lMaxADC.value - 1
         base = ctypes.cast(self.pnBuffer, ctypes.c_void_p).value
         for i, a in enumerate(arrays):
+            if self.envelope_burst:
+                a = self._apply_burst_envelope(a, float(self.SR))
             padded = np.zeros(seg_len, dtype=np.float64)
             padded[: a.size] = np.clip(a, -1.0, 1.0)
             codes = (max_dac * padded).astype(np.int16)
@@ -535,7 +645,9 @@ class Spectrum_AWG:
         if self.trigger_mode == "internal":
             print(
                 f"[Spectrum_AWG] Internal clock running (period ~{mem_us:.3f} us). "
-                "Ctrl+C to stop."
+                "Ctrl+C to stop.\n"
+                "  Scope tip: trigger on X0 (period marker), display Ch0 (RF). "
+                "Triggering on Ch0 RF makes the pulse walk L→R."
             )
         else:
             extra = ""

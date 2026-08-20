@@ -22,6 +22,8 @@ USE_DUMMY
 TRIGGER_MODE
     "internal"  AWG sample clock (INTPLL). No SRS delay generator, no photodiode.
                 Memory is RF + idle zeros so you see *pulses*, not a continuous wave.
+                IMPORTANT for the scope: trigger on the card's X0 marker (period sync),
+                NOT on Ch0 RF. Triggering on Ch0 makes the pulse walk left→right.
     "external"  Ext0 / Trg0. Office: SRS DG645 TTL. Lab: photodiode.
 
 PLAYBACK
@@ -46,6 +48,7 @@ from ps_calculations import Pulse_Shaper_Calculations
 # =====================================================================
 
 # True = no hardware. False = real M4i.6631-X8.
+# Must be False to see anything on the oscilloscope.
 USE_DUMMY = False
 
 T = 10       # (us) RF burst length inside one shot
@@ -173,17 +176,39 @@ if __name__ == "__main__":
             pulse = build_one_waveform(RL, tau=None)
 
             if TRIGGER_MODE == "internal":
-                # Pad RF with zeros so free-run on the sample clock is pulsed, not CW.
+                # Same order OPS used when internal pulses were visible:
+                # build period → resize → allocate → setup → load → DMA → (arm after plot).
                 period_s = INTERNAL_PERIOD_MS / 1000.0
                 period = awg.build_internal_period(pulse.Vt, period_s=period_s)
                 awg.reconfigure_for_sequence(period.size)
+                awg.allocate_buffer()
                 awg.setup_card(
                     trigger_mode="internal",
                     playback="single",
                     loops=0,
                 )
-                awg.allocate_buffer()
+                # setup_card may nudge RECORD_LENGTH only via multi; for single it
+                # keeps MEMSIZE = RECORD_LENGTH. Re-load into the buffer we have.
+                if period.size != awg.RECORD_LENGTH:
+                    print(
+                        f"[main] Period length {period.size} != "
+                        f"RECORD_LENGTH {awg.RECORD_LENGTH} — fixing."
+                    )
+                    awg.reconfigure_for_sequence(period.size)
+                    awg.allocate_buffer()
+                    awg.setup_card(trigger_mode="internal", playback="single", loops=0)
                 awg.load_waveform_in_buffer(period)
+                # Arm *before* the blocking plot so RF is already on Ch0 while
+                # you look at the matplotlib window / scope.
+                awg.write_waveform_to_card()
+                awg.output_waveform(wait_ready=False)
+                hz = awg.SR / float(awg.RECORD_LENGTH)
+                print(
+                    f"\n*** INTERNAL MODE armed ***  {hz:.6f} Hz  "
+                    f"peak|V|={np.max(np.abs(period)):.4f}\n"
+                    "  Close the plot, then leave running until Ctrl+C.\n"
+                    "  Scope: Ch0 = RF. Trigger source = Ch0 edge or Auto.\n"
+                )
             else:
                 awg.setup_card(
                     trigger_mode="external",
@@ -193,8 +218,9 @@ if __name__ == "__main__":
                 )
                 awg.allocate_buffer()
                 awg.load_waveform_in_buffer(pulse.Vt)
+                awg.write_waveform_to_card()
+                awg.output_waveform(wait_ready=False)
 
-            awg.write_waveform_to_card()
             pulse.plot_pulse_shaper_results("time")
             # pulse.plot_pulse_shaper_results("freq")
 
