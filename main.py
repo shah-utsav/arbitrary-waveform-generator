@@ -2,39 +2,11 @@
 pulse_shaper / main.py
 ======================
 
-Talk to a Spectrum M4i.6631-X8 AWG, or run the same steps with Dummy_AWG
-when the card is not connected.
-
-This file is meant to be *the* place you edit day to day — same idea as
-Optical-Pulse-Shaping/main.py: knobs at the top, pulse math in the middle,
-hardware steps at the bottom.
-
 How to run (from this folder):
     python main.py
 
--------------------------------------------------
-What the knobs mean
--------------------------------------------------
-USE_DUMMY
-    True  → Dummy_AWG. No card, no driver. Plots still work.
-    False → Spectrum_AWG. Needs the M4i and the Spectrum driver.
-
-TRIGGER_MODE
-    "internal"  AWG sample clock (INTPLL). No SRS delay generator, no photodiode.
-                Memory is RF + idle zeros so you see *pulses*, not a continuous wave.
-                IMPORTANT for the scope: trigger on the card's X0 marker (period sync),
-                NOT on Ch0 RF. Triggering on Ch0 makes the pulse walk left→right.
-    "external"  Ext0 / Trg0. Office: SRS DG645 TTL. Lab: photodiode.
-
-PLAYBACK
-    "single"  one waveform. External: that waveform on every trigger.
-              Internal: that waveform + zeros, repeating on the sample clock.
-    "multi"   several waveforms (see TAU_LIST).
-              External: next waveform on each trigger (Spectrum MULTI mode).
-              Internal: all waveforms concatenated, repeating on the sample clock.
-
-Pulse shaping (T, SR, F0, masks) is the PI's Pulse_Shaper_Calculations class,
-copied as-is into ps_calculations.py.
+Edit the knobs in "Set User Parameters". Pulse math lives in ps_calculations.py
+(leave that file alone — same as Optical-Pulse-Shaping).
 """
 
 import sys
@@ -44,182 +16,169 @@ import numpy as np
 from ps_calculations import Pulse_Shaper_Calculations
 
 # =====================================================================
-# Set User Parameters  (edit these — this is the lab "front panel")
+# Set User Parameters  (lab "front panel" — same idea as Optical-Pulse-Shaping)
 # =====================================================================
 
-# True = no hardware. False = real M4i.6631-X8.
-# Must be False to see anything on the oscilloscope.
-USE_DUMMY = False
+USE_DUMMY = False          # True = no card (plots / dry-run only)
 
-T = 10       # (us) RF burst length inside one shot
-SR = 1250    # (MSa/s) sampling rate  — M4i.6631-X8 max is 1250
-F0 = 100     # (MHz) rf / carrier frequency
-VOLTAGE_MAX_MV = 2000  # analog range into 50 Ω, millivolts (±80 … ±2000)
+T = 10                     # (us) RF burst length inside one shot
+SR = 1250                  # (MSa/s)  M4i.6631-X8 max = 1250
+F0 = 100                   # (MHz) carrier
+VOLTAGE_MAX_MV = 2000      # ±mV into 50 Ω
 
-# "internal"  = built-in sample clock (no delay generator)
-# "external"  = SRS delay generator or photodiode on Ext0 / Trg0
-TRIGGER_MODE = "internal"
+# Trigger / playback
+#   TRIGGER_MODE = "external" → each shot starts on Ext0 (DG645 or photodiode)
+#   TRIGGER_MODE = "internal" → see INTERNAL_SHOT_TRIGGER
+TRIGGER_MODE = "external"
 
-# "single" = same waveform every shot
-# "multi"  = different waveforms (one per tau in TAU_LIST)
-PLAYBACK = "single"
+# Only used when TRIGGER_MODE == "internal":
+#   "ext0"     — INTPLL sample clock + Ext0 shot start (desk default; no walk)
+#   "free_run" — no Ext0; free-run [tip?][RF|idle] on the sample clock
+INTERNAL_SHOT_TRIGGER = "ext0"
 
-# Internal only: full period of one replay, in milliseconds.
-# Example: 10 us of RF every 1 ms → T=10 and INTERNAL_PERIOD_MS=1.0
-INTERNAL_PERIOD_MS = 1.0
+PLAYBACK = "multi"        # "single" | "multi"
+LOOPS = 0                  # 0 = until Ctrl+C (Ext0 modes)
+EXT0_LEVEL_MV = 1500       # Ext0 threshold (mV), TTL ~1.5 V
+TAU_LIST = [0.0, 0.25, 0.5, 1.0]  # multi only: one segment per tau
 
-# External only: SPC_LOOPS. 0 = keep accepting triggers until Ctrl+C.
-LOOPS = 0
+# free_run only
+INTERNAL_PERIOD_MS = 1.0   # full period on the sample clock
+CH0_SCOPE_SYNC_TIP = True  # short full-scale tip before RF (scope Normal on Ch0)
 
-# External trigger threshold on Ext0 (TTL is typically ~1.5–2.5 V).
-EXT0_LEVEL_MV = 1500
-
-# Multi only: one double-pulse waveform per delay tau (same convention as OPS).
-# Uncomment / edit the list. Ignored when PLAYBACK = "single".
-TAU_LIST = [0.0, 0.25, 0.5, 1.0]
-
-# M4i memory length must be a multiple of 32 samples.
-RL = int(np.ceil(SR * T / 32) * 32)  # samples in one RF burst
+# Must be a multiple of 32 (M4i block size)
+RL = int(np.ceil(SR * T / 32) * 32)
 
 
 # =====================================================================
-# Pick dummy vs real card  (same methods either way)
+# Pick dummy vs real card
 # =====================================================================
 if USE_DUMMY:
     from hardware.AWG._dummyAWG import Dummy_AWG as AWG
     print("Using Dummy_AWG (no hardware).\n")
 else:
-    # Importing Spectrum_AWG loads the Spectrum DLL. If the DLL is missing
-    # the wrapper prints a short diagnosis instead of a ctypes traceback.
     from hardware.AWG._spectrumAWG import Spectrum_AWG as AWG
     print("Using Spectrum_AWG (real card).\n")
 
 
 def build_one_waveform(record_length, tau=None):
-    """
-    Build one V(t) with Pulse_Shaper_Calculations.
-
-    This block is the Optical-Pulse-Shaping/main.py workflow:
-    calibration → phase mask (pick one) → amplitude mask (pick one) → generate.
-
-    For PLAYBACK = "multi", tau is passed into AmpFcn.double_pulse.
-    For PLAYBACK = "single", uncomment the masks you want, same as the PI's file.
-    """
+    """Build one V(t) with Pulse_Shaper_Calculations (PI's math)."""
     pulse = Pulse_Shaper_Calculations(SR, record_length)
 
-    # --- Calibration (default [0, 1, 0] is set inside the class) ---
-    # pulse.calibration([5.4127, 0.0098, 0.1608])  # real calibration
+    # --- Calibration (default [0, 1, 0] inside ps_calculations) ---
+    # pulse.calibration([5.4127, 0.0098, 0.1608])
 
-    # --- Phase Shaping ---
+    # --- Phase shaping (pick at most one mask) ---
     pulse.set_carrier_freq_phi(F0)
-    ## Phase mask — uncomment at most one
     # pulse.PhiFcn.constant(pulse)
     # pulse.PhiFcn.taylor_series(pulse, 0, [0, 0, 2 * math.pi * 10])
     # pulse.PhiFcn.taylor_series(pulse, 6, [0, 0, -100, -1000])
-    # pulse.set_phi_eq()  # not implemented yet in ps_calculations.py
+    # pulse.set_phi_eq()
 
-    # --- Amplitude Shaping ---
+    # --- Amplitude shaping (pick at most one mask) ---
     pulse.set_amp_control(1)
-    ## Amplitude mask — uncomment at most one (double_pulse is used automatically in multi)
     # pulse.AmpFcn.constant(pulse)
     # pulse.AmpFcn.multi_gaussian(pulse, [2, 4, 6], 1)
     if tau is not None:
-        # R, w0, tau, phi  — same call as Optical-Pulse-Shaping / OPS
         pulse.AmpFcn.double_pulse(pulse, 1, 0, tau, 0)
     # else:
     #     pulse.AmpFcn.double_pulse(pulse, 1, 0, 1, 0)
-    # pulse.set_amp_eq()  # not implemented yet
+    # pulse.set_amp_eq()
 
-    pulse.generate_waveform(randomize_phi=True)
+    # Fixed phase when free-running (helps Ch0 tip / envelope triggering).
+    free = TRIGGER_MODE == "internal" and INTERNAL_SHOT_TRIGGER == "free_run"
+    pulse.generate_waveform(randomize_phi=not free)
     return pulse
+
+
+def card_trigger_mode():
+    """Map front-panel knobs → Spectrum_AWG trigger_mode string."""
+    if TRIGGER_MODE == "external":
+        return "external"
+    if TRIGGER_MODE == "internal" and INTERNAL_SHOT_TRIGGER == "ext0":
+        return "external"  # INTPLL clock + Ext0 shots (same lock as external)
+    return "internal"      # free_run
+
+
+def arm_and_load(awg, waveforms, trigger, playback, nseg=1):
+    """setup → allocate → load → write → output (one place for single & multi)."""
+    kwargs = dict(
+        trigger_mode=trigger,
+        playback=playback,
+        loops=LOOPS if trigger == "external" else 0,
+        ext0_level_mV=EXT0_LEVEL_MV,
+    )
+    if playback == "multi":
+        kwargs.update(num_segments=nseg, segment_samples=RL)
+
+    awg.setup_card(**kwargs)
+    awg.allocate_buffer()
+    if playback == "multi":
+        awg.load_waveforms_in_buffer(waveforms)
+    else:
+        awg.load_waveform_in_buffer(waveforms[0])
+    awg.write_waveform_to_card()
+    awg.output_waveform(wait_ready=False)
 
 
 # =====================================================================
 # Start AWG
 # =====================================================================
 if __name__ == "__main__":
-    awg = AWG(RL, SR, voltage_max_mV=VOLTAGE_MAX_MV)
+    card_trig = card_trigger_mode()
 
-    opened = awg.open_card()
-    if not opened:
+    awg = AWG(RL, SR, voltage_max_mV=VOLTAGE_MAX_MV)
+    if not awg.open_card():
         print("Stopping: the AWG was not opened. See the message above.")
         sys.exit(1)
 
     try:
         if PLAYBACK == "multi":
-            # Several waveforms, same length. Each tau → one segment.
+            # Multi needs Ext0 edges to advance segments.
             pulses = [build_one_waveform(RL, tau=tau) for tau in TAU_LIST]
             waveforms = [p.Vt for p in pulses]
             nseg = len(waveforms)
-
             print(f"PLAYBACK=multi  {nseg} segments  taus={TAU_LIST}")
 
             awg.reconfigure_for_sequence(RL * nseg)
-            awg.setup_card(
-                trigger_mode=TRIGGER_MODE,
-                playback="multi",
-                loops=LOOPS,
-                num_segments=nseg,
-                segment_samples=RL,
-                ext0_level_mV=EXT0_LEVEL_MV,
-            )
-            awg.allocate_buffer()
-            awg.load_waveforms_in_buffer(waveforms)
-            awg.write_waveform_to_card()
-
-            # Plot the first segment so the usual 2×2 figure still appears.
+            arm_and_load(awg, waveforms, trigger="external", playback="multi", nseg=nseg)
             pulses[0].plot_pulse_shaper_results("time")
-            # pulses[0].plot_pulse_shaper_results("freq")
 
         else:
-            # One waveform — Optical-Pulse-Shaping/main.py path.
             pulse = build_one_waveform(RL, tau=None)
 
-            if TRIGGER_MODE == "internal":
-                # Same order OPS used when internal pulses were visible:
-                # build period → resize → allocate → setup → load → DMA → (arm after plot).
-                period_s = INTERNAL_PERIOD_MS / 1000.0
-                period = awg.build_internal_period(pulse.Vt, period_s=period_s)
-                awg.reconfigure_for_sequence(period.size)
-                awg.allocate_buffer()
-                awg.setup_card(
-                    trigger_mode="internal",
-                    playback="single",
-                    loops=0,
+            if card_trig == "internal":
+                # True free-run: [tip?][RF|idle] on sample clock, no Ext0.
+                awg.scope_lock_pulse = CH0_SCOPE_SYNC_TIP
+                awg.envelope_burst = True
+                period = awg.build_internal_period(
+                    pulse.Vt, period_s=INTERNAL_PERIOD_MS / 1000.0
                 )
-                # setup_card may nudge RECORD_LENGTH only via multi; for single it
-                # keeps MEMSIZE = RECORD_LENGTH. Re-load into the buffer we have.
-                if period.size != awg.RECORD_LENGTH:
-                    print(
-                        f"[main] Period length {period.size} != "
-                        f"RECORD_LENGTH {awg.RECORD_LENGTH} — fixing."
-                    )
-                    awg.reconfigure_for_sequence(period.size)
-                    awg.allocate_buffer()
-                    awg.setup_card(trigger_mode="internal", playback="single", loops=0)
-                awg.load_waveform_in_buffer(period)
-                # Arm *before* the blocking plot so RF is already on Ch0 while
-                # you look at the matplotlib window / scope.
-                awg.write_waveform_to_card()
-                awg.output_waveform(wait_ready=False)
+                awg.reconfigure_for_sequence(period.size)
+                arm_and_load(awg, [period], trigger="internal", playback="single")
+
+                tip_n = getattr(awg, "_scope_lock_samples", 0)
+                tip_us = 1e6 * tip_n / awg.SR if tip_n else 0.0
                 hz = awg.SR / float(awg.RECORD_LENGTH)
                 print(
-                    f"\n*** INTERNAL MODE armed ***  {hz:.6f} Hz  "
-                    f"peak|V|={np.max(np.abs(period)):.4f}\n"
-                    "  Close the plot, then leave running until Ctrl+C.\n"
-                    "  Scope: Ch0 = RF. Trigger source = Ch0 edge or Auto.\n"
+                    f"\n*** FREE-RUN INTERNAL armed ***  {hz:.6f} Hz\n"
+                    f"  Ch0: [{tip_us:.2f} us tip][RF {T} us][idle]\n"
+                    "  Scope: leave DG645; Normal / Rising on Ch0 tip.\n"
+                    "  If the scope stays on the DG645, the pulse WILL walk.\n"
                 )
             else:
-                awg.setup_card(
-                    trigger_mode="external",
-                    playback="single",
-                    loops=LOOPS,
-                    ext0_level_mV=EXT0_LEVEL_MV,
-                )
-                awg.allocate_buffer()
-                awg.load_waveform_in_buffer(pulse.Vt)
-                awg.write_waveform_to_card()
-                awg.output_waveform(wait_ready=False)
+                # Ext0 shots + INTPLL sample clock (locked like "external").
+                awg.scope_lock_pulse = False
+                awg.envelope_burst = False
+                arm_and_load(awg, [pulse.Vt], trigger="external", playback="single")
+
+                if TRIGGER_MODE == "internal":
+                    print(
+                        "\n*** INTERNAL (INTPLL) + Ext0 shot trigger ***\n"
+                        "  DG645 TTL → AWG Trg0/Ext0. Scope on DG645 — no walk.\n"
+                        "  For no-DG645 free-run: INTERNAL_SHOT_TRIGGER = \"free_run\".\n"
+                    )
+                else:
+                    print("\n*** EXTERNAL Ext0 mode armed ***\n")
 
             pulse.plot_pulse_shaper_results("time")
             # pulse.plot_pulse_shaper_results("freq")

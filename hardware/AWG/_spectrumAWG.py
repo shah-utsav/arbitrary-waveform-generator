@@ -1,148 +1,101 @@
 """
-Spectrum M4i.6631-X8 analog-output (AWG) wrapper.
+Spectrum M4i.6631-X8 wrapper (ctypes + pyspcm).
 
-This is the same *style* of wrapper as Optical-Pulse-Shaping: ctypes + pyspcm,
-one class, one method per hardware step. Dummy_AWG in this folder uses the
-same method names so you can swap backends in main.py.
+Same call order as Optical-Pulse-Shaping:
+    open_card → setup_card → allocate_buffer → load_* → write → output
 
-Card memory / replay modes we use (all with the card's internal sample clock):
-  - internal + single  →  SPC_REP_STD_SINGLE
-        One software trigger starts free-run. Memory is [RF burst | idle zeros]
-        so the built-in clock sets the period. No delay generator needed.
-  - external + single  →  SPC_REP_STD_SINGLERESTART
-        Each rising edge on Ext0 (Trg0) plays the same MEMSIZE once.
-        Office: SRS delay generator. Lab: photodiode.
-  - external + multi   →  SPC_REP_STD_MULTI
-        Memory is split into equal segments. Ext0 #1 → segment 0, #2 → segment 1, …
-  - internal + multi   →  SPC_REP_STD_SINGLE
-        All segments are concatenated into one period (optional idle after each)
-        and free-run on the sample clock. No host retrigger loop.
+One setup_card() covers internal/external and single/multi.
+Dummy_AWG mirrors this API with no hardware.
 
-M4i rule: MEMSIZE, SEGMENTSIZE, and DMA length must be multiples of 32 samples.
+Modes (sample clock is always INTPLL):
+  internal + single   → SPC_REP_STD_SINGLE + LOOPS=0
+                        free-run [RF | idle]; pad with build_internal_period()
+  external + single   → SPC_REP_STD_SINGLERESTART  (one Ext0 = one play)
+  external + multi    → SPC_REP_STD_MULTI          (Ext0 advances segments)
+  internal + multi    → SPC_REP_STD_SINGLE         (segments concatenated, free-run)
+
+MEMSIZE / SEGMENTSIZE / DMA length must be multiples of 32.
 """
 
 import ctypes
-import sys
 import time
 
 import numpy as np
 
-# pyspcm loads Spectrum's DLL at import time (spcm_win64.dll on Windows).
-# If that fails we do *not* dump a ctypes traceback — we print what to do.
+from ._awg_helpers import align32, apply_burst_envelope, build_internal_period
+
 try:
-    from .spectrum_AWG_drivers.pyspcm import *
-    from .spectrum_AWG_drivers.spcm_tools import *
+    try:
+        from .spectrum_AWG_drivers.pyspcm import *
+        from .spectrum_AWG_drivers.spcm_tools import *
+    except ImportError:
+        from hardware.AWG.spectrum_AWG_drivers.pyspcm import *
+        from hardware.AWG.spectrum_AWG_drivers.spcm_tools import *
 except OSError as exc:
     print(
         "\n[Spectrum_AWG] Could not load the Spectrum driver library.\n"
-        "  Windows looks for  spcm_win64.dll  (or spcm_win32.dll).\n"
-        "  Linux   looks for  libspcm_linux.so.\n\n"
-        "  Typical fixes:\n"
-        "    1. Install the Spectrum Instrumentation driver for the M4i card.\n"
-        "    2. Close SBench 6 if it is open (it can hold the driver).\n"
-        "    3. If you only want to look at plots / debug math, set\n"
-        "       USE_DUMMY = True  in main.py  (no card required).\n\n"
-        f"  Underlying OS error: {exc}\n"
+        "  Windows: spcm_win64.dll   Linux: libspcm_linux.so\n"
+        "  Install the Spectrum driver, close SBench 6, or set USE_DUMMY = True.\n"
+        f"  OS error: {exc}\n"
     )
     raise SystemExit(1)
 
 
-def _align32(n):
-    """Round sample count up to a multiple of 32 (M4i DMA / MEMSIZE rule)."""
-    n = int(n)
-    if n % 32 == 0:
-        return n
-    return n + (32 - n % 32)
-
-
 class Spectrum_AWG:
     def __init__(self, record_length, sampling_rate_MSa_s, voltage_max_mV, verbose=True):
-        """
-        Store user numbers. Nothing is sent to the card yet.
-
-        record_length        : samples in the *first* buffer you plan to load
-                               (for multi, this is usually one segment; setup_card
-                               will grow RECORD_LENGTH to N × segment).
-        sampling_rate_MSa_s  : Mega-samples per second. M4i.6631-X8 max is 1250.
-        voltage_max_mV       : analog range into 50 Ω, millivolts (80 … 2000).
-        """
-        # Practical host-RAM limit is well below the card's ~2e9 sample max.
         if not (32 <= record_length <= 125e6):
-            print(
-                f"[Spectrum_AWG] Record length {record_length} is outside "
-                f"32 … 125e6 samples (the useful range on a typical PC)."
-            )
+            print(f"[Spectrum_AWG] Record length {record_length} outside 32 … 125e6.")
             raise SystemExit(1)
-        self.RECORD_LENGTH = int(record_length)
-
         if not (0 < sampling_rate_MSa_s <= 1250):
-            print(
-                f"[Spectrum_AWG] Sampling rate {sampling_rate_MSa_s} MSa/s is "
-                f"outside 0 … 1250 (M4i.6631-X8 maximum)."
-            )
+            print(f"[Spectrum_AWG] Sampling rate {sampling_rate_MSa_s} outside 0 … 1250 MSa/s.")
             raise SystemExit(1)
-        self.SR = int(sampling_rate_MSa_s * 1e6)  # convert MSa/s → Sa/s
-
         if not (80 <= voltage_max_mV <= 2000):
-            print(
-                f"[Spectrum_AWG] Output range {voltage_max_mV} mV is outside "
-                f"±80 mV … ±2000 mV (50 Ω)."
-            )
+            print(f"[Spectrum_AWG] Output range {voltage_max_mV} mV outside 80 … 2000.")
             raise SystemExit(1)
+
+        self.RECORD_LENGTH = int(record_length)
+        self.SR = int(sampling_rate_MSa_s * 1e6)  # MSa/s → Sa/s
         self.OUTPUT_RANGE_MV = int(voltage_max_mV)
-
         self.verbose = verbose
-        self.hCard = None              # driver handle, set by open_card()
-        self.lMaxADC = None            # 16-bit full scale, typically 32768
-        self.lBytesPerSample = None    # 2 for 16-bit
-        self.pvBuffer = None           # page-aligned DMA buffer
-        self.pnBuffer = None           # same buffer viewed as int16*
 
-        # Remember how the card was last configured (dummy mirrors these).
-        self.trigger_mode = "internal"   # "internal" or "external"
-        self.playback = "single"         # "single" or "multi"
+        self.hCard = None
+        self.lMaxADC = None
+        self.lBytesPerSample = None
+        self.pvBuffer = None
+        self.pnBuffer = None
+
+        self.trigger_mode = "internal"
+        self.playback = "single"
         self.loops = 0
         self.num_segments = 1
         self.segment_length = int(record_length)
         self._card_is_running = False
-        # Optional soft on/off of RF edges (off by default — keep RF as the PI built it).
-        self.envelope_burst = False
-        # Optional short DC tip for Ch0 scope-lock (off by default).
-        self.scope_lock_pulse = False
+
+        # Optional extras (set from main before setup / load)
+        self.envelope_burst = False   # soft RF edges (~200 ns)
+        self.scope_lock_pulse = False  # full-scale tip before RF (free_run scope lock)
         self._scope_lock_samples = 0
-        # Optional X0 period marker (off by default until internal RF is confirmed).
-        self.enable_x0_sync = False
+        self.enable_x0_sync = False   # optional X0 period / trigger marker
 
     # ------------------------------------------------------------------
     # Open / close
     # ------------------------------------------------------------------
 
     def open_card(self, device_path="/dev/spcm0"):
-        """
-        Open the Spectrum driver handle and confirm this is an analog-output card.
-
-        Spectrum uses Unix-looking paths even on Windows: /dev/spcm0, /dev/spcm1, …
-        If /dev/spcm0 is busy or empty we try the next few indices.
-
-        Returns True on success. On failure we print a plain-English diagnosis
-        and return False — we do not raise a ctypes stack trace.
-        """
+        """Open an analog-output card. Tries /dev/spcm0, then spcm1…"""
         tried = []
 
-        def _try_open(path):
+        def _try(path):
             tried.append(path)
-            handle = spcm_hOpen(create_string_buffer(path.encode("ascii")))
-            return handle
+            return spcm_hOpen(create_string_buffer(path.encode("ascii")))
 
-        self.hCard = _try_open(device_path)
-
+        self.hCard = _try(device_path)
         if not self.hCard:
-            # Another program (or another slot) may own spcm0.
             for idx in range(16):
                 path = f"/dev/spcm{idx}"
                 if path in tried:
                     continue
-                handle = _try_open(path)
+                handle = _try(path)
                 if not handle:
                     continue
                 fnc = int32(0)
@@ -151,40 +104,26 @@ class Spectrum_AWG:
                     self.hCard = handle
                     device_path = path
                     break
-                # Digitizer / other card — close and keep looking.
                 spcm_vClose(handle)
 
         if not self.hCard:
             print(
-                "\n[Spectrum_AWG] No Spectrum AWG card was detected.\n\n"
-                "  The program looked for a card at: "
-                + ", ".join(tried[:5])
-                + (" …" if len(tried) > 5 else "")
-                + "\n\n"
-                "  What is usually wrong:\n"
-                "    1. The M4i.6631-X8 is not installed, or the PC is not the lab PC.\n"
-                "    2. The Spectrum driver is installed but the card has no power / PCIe link.\n"
-                "    3. SBench 6 (or another Python script) already opened the card — close it.\n"
-                "    4. You only want to debug plots / math: set USE_DUMMY = True in main.py.\n"
+                "\n[Spectrum_AWG] No Spectrum AWG card detected.\n"
+                f"  Tried: {', '.join(tried[:5])}{' …' if len(tried) > 5 else ''}\n"
+                "  Check PCIe power / driver / close SBench 6 — or set USE_DUMMY = True.\n"
             )
             return False
 
-        # SPC_FNCTYPE must be analog output. Digitizers use a different value.
         lFncType = int32(0)
         spcm_dwGetParam_i32(self.hCard, SPC_FNCTYPE, byref(lFncType))
         if lFncType.value != SPCM_TYPE_AO:
-            print(
-                f"[Spectrum_AWG] {device_path} is not an analog-output (AWG) card.\n"
-                "  This program is written for the M4i.6631-X8 AWG."
-            )
+            print(f"[Spectrum_AWG] {device_path} is not an analog-output card.")
             spcm_vClose(self.hCard)
             self.hCard = None
             return False
 
-        # DAC full-scale integer (16-bit → 32768). We scale floats into this.
         self.lMaxADC = int32(0)
         spcm_dwGetParam_i32(self.hCard, SPC_MIINST_MAXADCVALUE, byref(self.lMaxADC))
-
         self.lBytesPerSample = int32(0)
         spcm_dwGetParam_i32(self.hCard, SPC_MIINST_BYTESPERSAMPLE, byref(self.lBytesPerSample))
 
@@ -196,7 +135,6 @@ class Spectrum_AWG:
         return True
 
     def close_card(self):
-        """Release the driver handle. Always call this (main.py uses try/finally)."""
         if self.hCard:
             self.stop_output()
             spcm_vClose(self.hCard)
@@ -207,17 +145,12 @@ class Spectrum_AWG:
                 print("[Spectrum_AWG] Card closed.")
 
     # ------------------------------------------------------------------
-    # Configure (one method for single, multi, internal, external)
+    # Configure
     # ------------------------------------------------------------------
 
     def reconfigure_for_sequence(self, total_samples):
-        """
-        Change RECORD_LENGTH *before* allocate_buffer().
-
-        Used when internal mode pads RF with idle zeros, or when multi
-        concatenates N segments.
-        """
-        total_samples = _align32(total_samples)
+        """Change RECORD_LENGTH before allocate_buffer() (padded period / multi)."""
+        total_samples = align32(total_samples)
         if total_samples < 32:
             print("[Spectrum_AWG] total_samples must be at least 32.")
             raise SystemExit(1)
@@ -233,134 +166,92 @@ class Spectrum_AWG:
         ext0_level_mV=1500,
     ):
         """
-        Program clock, memory layout, trigger, and analog output.
+        Program clock, memory, trigger, and Ch0 output.
 
-        trigger_mode
-            "internal"  (also accepts "software")
-                Start from software. Timing comes from SPC_SAMPLERATE (INTPLL).
-            "external"
-                Start from Ext0 / Trg0 (SRS delay generator or photodiode).
-
-        playback
-            "single"  one waveform in memory (same burst every shot)
-            "multi"   N equal segments (different burst every Ext0, or
-                      concatenated on the sample clock if trigger is internal)
-
-        loops
-            0 = keep going until stop_output() / Ctrl+C
-            N = stop after N plays (Spectrum's SPC_LOOPS)
-
-        The sample clock is always the card's internal PLL (SPC_CM_INTPLL).
-        We do not switch to an external reference clock here.
+        trigger_mode: "internal" (software start) | "external" (Ext0 / Trg0)
+        playback:     "single" | "multi"
+        loops:        0 = until stop; N = stop after N plays
         """
         if trigger_mode in ("software", "internal"):
             trigger_mode = "internal"
         if trigger_mode not in ("internal", "external"):
-            print(
-                f"[Spectrum_AWG] Unknown trigger_mode '{trigger_mode}'. "
-                "Use 'internal' or 'external'."
-            )
+            print(f"[Spectrum_AWG] Unknown trigger_mode '{trigger_mode}'.")
             raise SystemExit(1)
         if playback not in ("single", "multi"):
-            print(
-                f"[Spectrum_AWG] Unknown playback '{playback}'. "
-                "Use 'single' or 'multi'."
-            )
+            print(f"[Spectrum_AWG] Unknown playback '{playback}'.")
             raise SystemExit(1)
 
         self.trigger_mode = trigger_mode
         self.playback = playback
         self.loops = int(loops)
 
-        # ----- choose Spectrum CARDMODE -----
-        if playback == "multi" and trigger_mode == "external":
-            # One segment per Ext0 edge.
-            card_mode = SPC_REP_STD_MULTI
+        # --- memory layout / Spectrum CARDMODE ---
+        if playback == "multi":
             if segment_samples is None:
                 segment_samples = self.RECORD_LENGTH // max(int(num_segments), 1)
-            self.segment_length = _align32(segment_samples)
+            self.segment_length = align32(segment_samples)
             self.num_segments = int(num_segments)
-            self.RECORD_LENGTH = self.segment_length * self.num_segments
-        elif playback == "multi" and trigger_mode == "internal":
-            # No Ext0: play every segment back-to-back on the sample clock.
-            # SINGLE + LOOPS=0 free-runs MEMSIZE after one software trigger
-            # (this is the path that produced visible pulses on the bench).
-            card_mode = SPC_REP_STD_SINGLE
-            if segment_samples is None:
-                segment_samples = self.RECORD_LENGTH // max(int(num_segments), 1)
-            self.segment_length = _align32(segment_samples)
-            self.num_segments = int(num_segments)
-            self.RECORD_LENGTH = _align32(self.segment_length * self.num_segments)
-            self.loops = 0
+            self.RECORD_LENGTH = align32(self.segment_length * self.num_segments)
+            if trigger_mode == "external":
+                card_mode = SPC_REP_STD_MULTI
+            else:
+                # No Ext0: concatenate segments and free-run on the sample clock.
+                card_mode = SPC_REP_STD_SINGLE
+                self.loops = 0
         elif trigger_mode == "external":
-            # Same MEMSIZE on every Ext0.
             card_mode = SPC_REP_STD_SINGLERESTART
             self.num_segments = 1
             self.segment_length = int(self.RECORD_LENGTH)
         else:
-            # Internal single: SINGLE + LOOPS=0 → one software start, then
-            # free-run MEMSIZE forever (M4i manual Table 52). Do NOT use
-            # SPC_REP_STD_CONTINUOUS here — on this card it can leave Ch0 quiet.
+            # Do NOT use SPC_REP_STD_CONTINUOUS here — quiet Ch0 on this bench.
             card_mode = SPC_REP_STD_SINGLE
             self.num_segments = 1
             self.segment_length = int(self.RECORD_LENGTH)
             self.loops = 0
 
-        # Replay mode + internal sample clock (the AWG's built-in clock).
         spcm_dwSetParam_i32(self.hCard, SPC_CARDMODE, card_mode)
         spcm_dwSetParam_i32(self.hCard, SPC_CLOCKMODE, SPC_CM_INTPLL)
+        spcm_dwSetParam_i64(self.hCard, SPC_CHENABLE, CHANNEL0)
         spcm_dwSetParam_i64(self.hCard, SPC_SAMPLERATE, int64(self.SR))
 
-        # Channel 0 only (matches Optical-Pulse-Shaping).
-        spcm_dwSetParam_i64(self.hCard, SPC_CHENABLE, 0x1)
-
-        # SEGMENTSIZE must equal MEMSIZE in non-MULTI modes.
-        if card_mode == SPC_REP_STD_MULTI:
-            spcm_dwSetParam_i64(self.hCard, SPC_SEGMENTSIZE, int64(self.segment_length))
-        else:
-            spcm_dwSetParam_i64(self.hCard, SPC_SEGMENTSIZE, int64(self.RECORD_LENGTH))
+        seg = self.segment_length if card_mode == SPC_REP_STD_MULTI else self.RECORD_LENGTH
+        spcm_dwSetParam_i64(self.hCard, SPC_SEGMENTSIZE, int64(seg))
         spcm_dwSetParam_i64(self.hCard, SPC_MEMSIZE, int64(self.RECORD_LENGTH))
         spcm_dwSetParam_i64(self.hCard, SPC_LOOPS, int64(self.loops))
 
-        # Trigger: Ext0 rising ~1.5 V (TTL), or software (internal).
+        # Trigger
         spcm_dwSetParam_i32(self.hCard, SPC_TRIG_ANDMASK, 0)
         if trigger_mode == "external":
             spcm_dwSetParam_i32(self.hCard, SPC_TRIG_ORMASK, SPC_TMASK_EXT0)
             spcm_dwSetParam_i32(self.hCard, SPC_TRIG_EXT0_MODE, SPC_TM_POS)
             spcm_dwSetParam_i32(self.hCard, SPC_TRIG_EXT0_LEVEL0, int32(int(ext0_level_mV)))
-            spcm_dwSetParam_i32(self.hCard, SPC_TRIG_TERM, 0)  # high-Z, not 50 Ω
+            spcm_dwSetParam_i32(self.hCard, SPC_TRIG_TERM, 0)  # high-Z
         else:
             spcm_dwSetParam_i32(self.hCard, SPC_TRIG_ORMASK, SPC_TMASK_SOFTWARE)
 
-        # Analog range and enable Ch0.
         spcm_dwSetParam_i32(self.hCard, SPC_AMP0, int32(self.OUTPUT_RANGE_MV))
         spcm_dwSetParam_i64(self.hCard, SPC_ENABLEOUT0, int32(1))
 
-        # Use the rate the card actually programmed (may differ slightly from
-        # the requested SR). Period timing follows this value.
         actual_sr = int64(0)
         spcm_dwGetParam_i64(self.hCard, SPC_SAMPLERATE, byref(actual_sr))
         if actual_sr.value > 0:
             self.SR = int(actual_sr.value)
 
-        # Optional once-per-period TTL on X0 (disabled by default).
         if self.enable_x0_sync:
-            self._enable_scope_sync_marker()
+            self._enable_x0_marker()
 
         if self.verbose:
-            mem_us = 1e6 * float(self.RECORD_LENGTH) / float(self.SR)
-            mem_hz = float(self.SR) / float(self.RECORD_LENGTH)
             names = {
                 SPC_REP_STD_SINGLE: "SINGLE",
                 SPC_REP_STD_SINGLERESTART: "SINGLERESTART",
                 SPC_REP_STD_MULTI: "MULTI",
             }
+            mem_us = 1e6 * self.RECORD_LENGTH / self.SR
             print(
-                f"[Spectrum_AWG] {names.get(card_mode, card_mode)}  "
-                f"clock=INTPLL  SR={self.SR * 1e-6} MSa/s  "
-                f"MEMSIZE={self.RECORD_LENGTH} (~{mem_us:.6f} us, {mem_hz:.9f} Hz)  "
-                f"trigger={trigger_mode}  playback={playback}  "
-                f"SPC_LOOPS={self.loops}"
+                f"[Spectrum_AWG] {names.get(card_mode, card_mode)}  INTPLL  "
+                f"SR={self.SR * 1e-6} MSa/s  MEMSIZE={self.RECORD_LENGTH} "
+                f"(~{mem_us:.3f} us)  trigger={trigger_mode}  playback={playback}  "
+                f"LOOPS={self.loops}"
             )
             if playback == "multi":
                 print(
@@ -368,193 +259,88 @@ class Spectrum_AWG:
                     f"{self.segment_length} samples"
                 )
 
+    def _enable_x0_marker(self):
+        """Optional X0 TTL: period mark (internal) or trigger-out (external)."""
+        try:
+            mode = (
+                SPCM_XMODE_CONTOUTMARK
+                if self.trigger_mode == "internal"
+                else SPCM_XMODE_TRIGOUT
+            )
+            err = spcm_dwSetParam_i32(self.hCard, SPCM_LEGACY_X0_MODE, mode)
+            if err != 0:
+                err = spcm_dwSetParam_i32(self.hCard, SPCM_X0_MODE, mode)
+            if self.verbose:
+                print(f"[Spectrum_AWG] X0 marker {'ok' if err == 0 else f'err={err}'}.")
+        except Exception as exc:
+            if self.verbose:
+                print(f"[Spectrum_AWG] X0 marker unavailable: {exc}")
+
     # ------------------------------------------------------------------
-    # Buffers and waveforms
+    # Buffers / waveforms
     # ------------------------------------------------------------------
 
     def allocate_buffer(self):
-        """Page-aligned host buffer for DMA (Spectrum requires 4096-byte align)."""
         nbytes = self.RECORD_LENGTH * self.lBytesPerSample.value
         self.pvBuffer = pvAllocMemPageAligned(nbytes)
         self.pnBuffer = cast(self.pvBuffer, ptr16)
         if self.verbose:
-            print(
-                f"[Spectrum_AWG] Allocated buffer of {self.RECORD_LENGTH} int16 samples."
-            )
-
-    def _enable_scope_sync_marker(self):
-        """
-        Drive multi-purpose connector X0 as a once-per-period TTL for the scope.
-
-        Manual note: CONTOUTMARK marks the beginning of each continuous-replay
-        loop; the pulse is ~½ MEMSIZE long. Use the *legacy* X0 register first
-        (47200) — that is what the M4i.66xx manual documents.
-        """
-        try:
-            if self.trigger_mode == "internal":
-                mode = SPCM_XMODE_CONTOUTMARK
-                label = "CONTOUTMARK (once per MEMSIZE period)"
-                # Some firmware builds also want this enable bit.
-                try:
-                    spcm_dwSetParam_i32(self.hCard, SPC_CONTOUTMARK, int32(1))
-                except Exception:
-                    pass
-            else:
-                mode = SPCM_XMODE_TRIGOUT
-                label = "TRIGOUT (once per accepted Ext0)"
-
-            # Manual lists SPCM_X0_MODE = 47200 (legacy). Try that first.
-            err = spcm_dwSetParam_i32(self.hCard, SPCM_LEGACY_X0_MODE, mode)
-            if err != 0:
-                err = spcm_dwSetParam_i32(self.hCard, SPCM_X0_MODE, mode)
-
-            if self.verbose:
-                if err == 0:
-                    print(
-                        f"[Spectrum_AWG] X0 sync enabled: {label}."
-                    )
-                else:
-                    print(
-                        f"[Spectrum_AWG] X0 sync setup returned err={err} — "
-                        "use the Ch0 lock tip or match the DG645 rate printed above."
-                    )
-        except Exception as exc:
-            if self.verbose:
-                print(f"[Spectrum_AWG] X0 sync not available: {exc}")
-
-    @staticmethod
-    def _apply_burst_envelope(burst, sr_hz):
-        """
-        Raised-cosine on/off (~200 ns) so Ch0 has one clear amplitude edge
-        per burst. Helps if the scope is still accidentally triggering on Ch0
-        RF cycles instead of on the lock tip / X0.
-        """
-        x = np.asarray(burst, dtype=np.float64).copy()
-        n = x.size
-        if n < 64:
-            return x
-        edge = int(round(200e-9 * float(sr_hz)))
-        edge = max(32, min(edge, n // 10))
-        ramp = 0.5 * (1.0 - np.cos(np.pi * np.arange(edge) / float(edge)))
-        x[:edge] *= ramp
-        x[-edge:] *= ramp[::-1]
-        return x
-
-    @staticmethod
-    def _nearest_align32(n):
-        """Nearest multiple of 32 (ties round up). M4i DMA / MEMSIZE rule."""
-        n = int(max(n, 32))
-        lo = (n // 32) * 32
-        hi = lo + 32
-        if lo < 32:
-            return hi
-        if n - lo <= hi - n:
-            return lo
-        return hi
+            print(f"[Spectrum_AWG] Allocated buffer of {self.RECORD_LENGTH} samples.")
 
     def build_internal_period(self, burst, period_s):
-        """
-        Build one sample-clock period: [RF burst | idle zeros].
-
-        Free-running only the RF burst back-to-back looks like CW. Padding
-        idle to period_s makes the built-in clock the pulse repetition clock.
-
-        MEMSIZE is rounded *up* to a multiple of 32 (M4i rule), same as the
-        first working internal path in this project.
-        """
-        burst = np.asarray(burst, dtype=np.float64).ravel()
-        if self.envelope_burst:
-            burst = self._apply_burst_envelope(burst, float(self.SR))
-
-        tip_n = 0
-        gap_n = 0
-        if self.scope_lock_pulse:
-            tip_n = _align32(max(32, int(round(100e-9 * float(self.SR)))))
-            gap_n = tip_n
-
-        burst_n = _align32(max(burst.size, 32))
-        head = tip_n + gap_n
-        # Round UP (not nearest) — matches the path that showed pulses on the bench.
-        total = _align32(max(head + burst_n + 32, int(round(float(period_s) * float(self.SR)))))
-
-        period = np.zeros(total, dtype=np.float64)
-        if tip_n:
-            period[:tip_n] = 0.95
-            self._scope_lock_samples = tip_n
-        n = min(burst.size, burst_n)
-        period[head : head + n] = np.clip(burst[:n], -1.0, 1.0)
-
+        """Pad RF with idle zeros so the sample clock sets the repetition rate."""
+        period, tip_n = build_internal_period(
+            burst,
+            self.SR,
+            period_s,
+            envelope=self.envelope_burst,
+            scope_tip=self.scope_lock_pulse,
+        )
+        self._scope_lock_samples = tip_n
         if self.verbose:
-            actual_hz = float(self.SR) / float(total)
+            hz = self.SR / float(period.size)
             print(
-                f"[Spectrum_AWG] Internal period: RF={n} samples, "
-                f"idle={total - head - n}, tip={tip_n}, total={total} "
-                f"({1e6 * total / self.SR:.6f} us, {actual_hz:.9f} Hz). "
-                f"peak|V|={np.max(np.abs(period)):.4f}"
+                f"[Spectrum_AWG] Internal period: {period.size} samples "
+                f"({1e6 * period.size / self.SR:.6f} us, {hz:.9f} Hz)"
             )
         return period
 
     def load_waveform_in_buffer(self, voltage_array):
-        """
-        Copy one float waveform ([-1, 1]) into the DMA buffer as int16 DAC codes.
-
-        Length must equal RECORD_LENGTH. For internal single mode, pass the
-        output of build_internal_period(), not the bare RF burst.
-        """
+        """Copy one float waveform (−1…1) into the DMA buffer as int16."""
         voltage_array = np.asarray(voltage_array, dtype=np.float64).ravel()
         if voltage_array.size != self.RECORD_LENGTH:
             print(
-                f"[Spectrum_AWG] Waveform length {voltage_array.size} does not match "
-                f"buffer {self.RECORD_LENGTH}. For internal mode, pad with "
-                "build_internal_period() first."
+                f"[Spectrum_AWG] Waveform length {voltage_array.size} != "
+                f"buffer {self.RECORD_LENGTH}."
             )
             raise SystemExit(1)
 
-        # External single: envelope here (internal already applied in build_internal_period).
         if self.envelope_burst and self.trigger_mode == "external":
-            voltage_array = self._apply_burst_envelope(voltage_array, float(self.SR))
+            voltage_array = apply_burst_envelope(voltage_array, float(self.SR))
 
-        max_dac = self.lMaxADC.value - 1  # 32767; avoids wrapping at +32768
-        below = np.any(voltage_array < -1)
-        above = np.any(voltage_array > 1)
-        if below or above:
-            print(
-                "[Spectrum_AWG] Warning: waveform clipped to [-1, 1] before DAC scaling."
-            )
-        clipped = np.clip(voltage_array, -1, 1)
-        codes = (max_dac * clipped).astype(np.int16)
-
+        max_dac = self.lMaxADC.value - 1
+        codes = (max_dac * np.clip(voltage_array, -1.0, 1.0)).astype(np.int16)
         ctypes.memmove(self.pnBuffer, codes.ctypes.data, codes.nbytes)
         if self.verbose:
             print("[Spectrum_AWG] Loaded waveform into buffer.")
 
     def load_waveforms_in_buffer(self, voltage_arrays):
-        """
-        Concatenate several float waveforms into the DMA buffer.
-
-        Layout: [seg0 | seg1 | … | segN-1]  — this is what MULTI expects,
-        and it is also what internal-multi free-run expects.
-        Every array must be the same length (we pad to a multiple of 32).
-        """
+        """Concatenate equal-length segments into the DMA buffer (MULTI / multi)."""
         arrays = [np.asarray(a, dtype=np.float64).ravel() for a in voltage_arrays]
         if not arrays:
-            print("[Spectrum_AWG] load_waveforms_in_buffer needs at least one waveform.")
+            print("[Spectrum_AWG] Need at least one waveform.")
             raise SystemExit(1)
         raw_len = arrays[0].size
         for i, a in enumerate(arrays):
             if a.size != raw_len:
-                print(
-                    f"[Spectrum_AWG] Segment {i} length {a.size} != segment 0 length {raw_len}."
-                )
+                print(f"[Spectrum_AWG] Segment {i} length {a.size} != {raw_len}.")
                 raise SystemExit(1)
 
-        seg_len = _align32(raw_len)
-        expected = seg_len * len(arrays)
-        if expected != self.RECORD_LENGTH:
+        seg_len = align32(raw_len)
+        if seg_len * len(arrays) != self.RECORD_LENGTH:
             print(
-                f"[Spectrum_AWG] Concatenated length {expected} != buffer {self.RECORD_LENGTH}. "
-                "Call setup_card(..., playback='multi', num_segments=N, segment_samples=...) "
-                "and allocate_buffer() first."
+                f"[Spectrum_AWG] Concatenated length {seg_len * len(arrays)} != "
+                f"buffer {self.RECORD_LENGTH}. Call setup_card(playback='multi', …) first."
             )
             raise SystemExit(1)
 
@@ -562,7 +348,7 @@ class Spectrum_AWG:
         base = ctypes.cast(self.pnBuffer, ctypes.c_void_p).value
         for i, a in enumerate(arrays):
             if self.envelope_burst:
-                a = self._apply_burst_envelope(a, float(self.SR))
+                a = apply_burst_envelope(a, float(self.SR))
             padded = np.zeros(seg_len, dtype=np.float64)
             padded[: a.size] = np.clip(a, -1.0, 1.0)
             codes = (max_dac * padded).astype(np.int16)
@@ -572,12 +358,9 @@ class Spectrum_AWG:
             )
             ctypes.memmove(dest, codes.ctypes.data, codes.nbytes)
         if self.verbose:
-            print(
-                f"[Spectrum_AWG] Loaded {len(arrays)} segments × {seg_len} samples into buffer."
-            )
+            print(f"[Spectrum_AWG] Loaded {len(arrays)} × {seg_len} samples.")
 
     def write_waveform_to_card(self):
-        """DMA the host buffer onto the card (blocks until the copy finishes)."""
         nbytes = self.RECORD_LENGTH * self.lBytesPerSample.value
         spcm_dwDefTransfer_i64(
             self.hCard,
@@ -599,25 +382,16 @@ class Spectrum_AWG:
     def output_waveform(self, wait_ready=True):
         """
         Arm the card.
-
-        internal : START + ENABLETRIGGER + FORCETRIGGER
-                   (one software start; then the sample clock owns the timing)
-        external : START + ENABLETRIGGER
-                   (card waits for Ext0; do not FORCETRIGGER)
-
-        wait_ready: if True, block until the card reports READY. Internal
-        free-run (SINGLE + LOOPS=0) never goes READY — we skip WAITREADY there.
+          internal → START + ENABLETRIGGER + FORCETRIGGER (once)
+          external → START + ENABLETRIGGER (wait for Ext0)
         """
         if self.trigger_mode == "internal":
-            cmd = (
-                M2CMD_CARD_START
-                | M2CMD_CARD_ENABLETRIGGER
-                | M2CMD_CARD_FORCETRIGGER
-            )
+            cmd = M2CMD_CARD_START | M2CMD_CARD_ENABLETRIGGER | M2CMD_CARD_FORCETRIGGER
         else:
             cmd = M2CMD_CARD_START | M2CMD_CARD_ENABLETRIGGER
 
-        if wait_ready and not (self.trigger_mode == "internal" and int(self.loops) == 0):
+        # Free-run SINGLE+LOOPS=0 never goes READY — skip WAITREADY there.
+        if wait_ready and not (self.trigger_mode == "internal" and self.loops == 0):
             cmd |= M2CMD_CARD_WAITREADY
 
         spcm_dwSetParam_i32(self.hCard, SPC_M2CMD, cmd)
@@ -626,36 +400,22 @@ class Spectrum_AWG:
             print("[Spectrum_AWG] Output started. Card is armed / running.")
 
     def retrigger(self):
-        """
-        Extra software trigger pulse. Not used for internal free-run (that
-        would fight the sample clock). Kept so Dummy_AWG and this class match.
-        """
+        """Extra software trigger. Not used for free-run (would fight the clock)."""
         if self.verbose:
-            print("[Spectrum_AWG] Software retrigger (ENABLETRIGGER).")
+            print("[Spectrum_AWG] Software retrigger.")
         spcm_dwSetParam_i32(self.hCard, SPC_M2CMD, M2CMD_CARD_ENABLETRIGGER)
 
     def run_until_interrupt(self):
-        """
-        Keep the card running until Ctrl+C.
-
-        We arm once and then just sleep. Re-arming from Python on every loop
-        adds host jitter and can look like a 'walking' pulse on a scope.
-        """
-        mem_us = 1e6 * float(self.RECORD_LENGTH) / float(self.SR)
+        """Arm once, then sleep until Ctrl+C. Do not re-arm in a Python loop."""
+        mem_us = 1e6 * self.RECORD_LENGTH / self.SR
         if self.trigger_mode == "internal":
             print(
-                f"[Spectrum_AWG] Internal clock running (period ~{mem_us:.3f} us). "
-                "Ctrl+C to stop.\n"
-                "  Scope tip: trigger on X0 (period marker), display Ch0 (RF). "
-                "Triggering on Ch0 RF makes the pulse walk L→R."
+                f"[Spectrum_AWG] Internal free-run (~{mem_us:.3f} us/period). Ctrl+C to stop."
             )
         else:
-            extra = ""
-            if self.playback == "multi":
-                extra = f"  ({self.num_segments} segments, one per Ext0)"
+            extra = f"  ({self.num_segments} segments)" if self.playback == "multi" else ""
             print(
-                f"[Spectrum_AWG] Waiting for Ext0 / Trg0 (~{mem_us:.3f} us per play)."
-                f"{extra}  Ctrl+C to stop."
+                f"[Spectrum_AWG] Waiting for Ext0 (~{mem_us:.3f} us/play).{extra}  Ctrl+C to stop."
             )
 
         try:
@@ -669,7 +429,6 @@ class Spectrum_AWG:
             self.stop_output()
 
     def stop_output(self):
-        """Halt replay. The handle stays open until close_card()."""
         if self.hCard is None:
             self._card_is_running = False
             return
